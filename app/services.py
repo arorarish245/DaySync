@@ -2,6 +2,9 @@ import json
 import google.generativeai as genai
 from tavily import TavilyClient
 from app.config import settings
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+import time
 
 # Configure the API globally for this service
 genai.configure(api_key=settings.GEMINI_API_KEY)
@@ -104,3 +107,54 @@ def extract_specific_places_from_search(search_results: list, activity: dict) ->
     except Exception as e:
         print(f"Failed to extract specific places: {e}")
         return []
+
+# Initialize the map tool (OpenStreetMap requires a custom user_agent name)
+geolocator = Nominatim(user_agent="DaySync_Local_Logistics_App")
+
+def get_coordinates(place_name: str):
+    """Turns a text address into GPS coordinates."""
+    try:
+        # Ask the map for the location
+        location = geolocator.geocode(place_name, timeout=10)
+        if location:
+            return (location.latitude, location.longitude)
+        return None
+    except Exception as e:
+        print(f"Map error for {place_name}: {e}")
+        return None
+
+def filter_by_distance(base_location: str, suggested_places: list, max_radius_km: float = 10.0) -> list:
+    """Filters out AI suggestions that are too far away."""
+    
+    # 1. Find the coordinates of the neighborhood the user asked for (e.g., "Gandhinagar, Ahmedabad")
+    base_coords = get_coordinates(base_location)
+    
+    if not base_coords:
+        print(f"Could not find base location on map: {base_location}")
+        return suggested_places # If the map fails, just return the AI's list to be safe
+
+    valid_places = []
+    
+    for place in suggested_places:
+        # To make the map search accurate, we combine the place name with the city
+        search_query = f"{place['name']}, {base_location}"
+        place_coords = get_coordinates(search_query)
+        
+        if place_coords:
+            # Calculate the distance in kilometers
+            distance = geodesic(base_coords, place_coords).kilometers
+            print(f"Distance to {place['name']}: {distance:.2f} km")
+            
+            # If it's within our radius, keep it!
+            if distance <= max_radius_km:
+                valid_places.append(place)
+            else:
+                print(f"TRASHED: {place['name']} is too far ({distance:.2f} km)")
+        else:
+            # If the map can't find the specific restaurant, keep it just in case
+            valid_places.append(place)
+            
+        # OpenStreetMap is free, but they require us to wait 1 second between searches
+        time.sleep(1) 
+        
+    return valid_places
