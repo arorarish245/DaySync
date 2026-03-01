@@ -6,6 +6,7 @@ from app.config import settings
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import time
+import requests
 
 # Configure the API globally for this service
 genai.configure(api_key=settings.GEMINI_API_KEY)
@@ -37,39 +38,51 @@ Follow this exact JSON schema:
 
 def extract_data_with_ai(user_prompt: str, user_city: str) -> dict:
     model = genai.GenerativeModel(
-        'gemini-2.5-flash',
+        'gemini-2.5-flash', 
         generation_config={"response_mime_type": "application/json"}
     )
     
     full_prompt = f"{SYSTEM_PROMPT}\n\nUser's Current/Target City: {user_city}\n\nUser Prompt: {user_prompt}"
     response = model.generate_content(full_prompt)
     
-    return json.loads(response.text)
+    try:
+        # Strip invisible markdown blocks just in case the AI added them
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_text)
+    except Exception as e:
+        print(f"CRITICAL JSON ERROR IN SYSTEM PROMPT: {e}")
+        print(f"RAW AI OUTPUT: {response.text}")
+        # Return a safe fallback so the app doesn't crash
+        return {"location": user_city, "budget": "unspecified", "activities": []}
 
 
 def search_for_places(location: str, activity: dict) -> list:
-    """Uses Tavily to search the web for real FAMOUS places matching the AI's criteria."""
-    
-    # Initialize the Tavily client
+    """Uses Tavily to search the web using optimized, natural keywords."""
     tavily_client = TavilyClient(api_key=settings.TAVILY_API_KEY)
     
-    # Construct a highly specific Google search query
-    query = f"Most famous, iconic, and top-rated {activity['type']} in {location} "
-    if activity.get('specific_request') and activity['specific_request'] != "unspecified":
-         query += f"serving {activity['specific_request']} "
-    if activity.get('vibe') and activity['vibe'] != "unspecified":
-         query += f"with a {activity['vibe']} vibe"
+    # Clean up the variables (remove 'unspecified' junk)
+    place_type = activity.get('type', 'place')
+    specifics = activity.get('specific_request', '').replace('unspecified', '').strip()
+    vibe = activity.get('vibe', '').replace('unspecified', '').strip()
+    
+    # Build a natural search engine query
+    query_parts = ["Top rated"]
+    
+    if vibe:
+        query_parts.append(vibe) # e.g., "quiet"
+        
+    query_parts.append(place_type) # e.g., "cafe"
+    query_parts.append(f"in {location}") # e.g., "in Indiranagar..."
+    
+    # Only add the specifics if it's not completely redundant
+    if specifics and specifics.lower() not in place_type.lower():
+        query_parts.append(f"known for {specifics}")
          
+    query = " ".join(query_parts)
     print(f"Searching web for: {query}")
     
-    # Execute the search
-    response = tavily_client.search(
-        query=query,
-        search_depth="basic",
-        max_results=4 
-    )
-    
-    # Extract just the clean results
+    # UPGRADE: Bumped max_results from 4 to 6 to give Gemini more raw text to read!
+    response = tavily_client.search(query=query, search_depth="basic", max_results=6)
     return response.get("results", [])
 
 def extract_specific_places_from_search(search_results: list, activity: dict) -> list:
@@ -102,15 +115,19 @@ def extract_specific_places_from_search(search_results: list, activity: dict) ->
     
     try:
         model = genai.GenerativeModel(
-            'gemini-2.5-flash',
+            'gemini-2.5-flash', 
             generation_config={"response_mime_type": "application/json"}
         )
         response = model.generate_content(extraction_prompt)
-        return json.loads(response.text)
+        
+        # Sanitize the output
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_text)
+        
     except Exception as e:
-        print(f"Failed to extract specific places: {e}")
+        print(f"Failed to parse places JSON: {e}")
+        # If the AI breaks, return an empty list so the graceful degradation takes over
         return []
-
 # Initialize the map tool (OpenStreetMap requires a custom user_agent name)
 geolocator = Nominatim(user_agent="DaySync_Local_Logistics_App")
 
@@ -188,3 +205,24 @@ def filter_by_distance(base_location: str, suggested_places: list, max_radius_km
         time.sleep(1) 
         
     return valid_places
+
+def get_driving_time(coords1: dict, coords2: dict) -> float:
+    """Uses the free OSRM API to get real driving time in minutes between two places."""
+    # OSRM strictly requires coordinates in Longitude, Latitude order
+    lon1, lat1 = coords1["lng"], coords1["lat"]
+    lon2, lat2 = coords2["lng"], coords2["lat"]
+    
+    url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false"
+    
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("code") == "Ok":
+                # OSRM returns time in seconds. Convert to minutes.
+                duration_seconds = data["routes"][0]["duration"]
+                return round(duration_seconds / 60, 2)
+    except Exception as e:
+        print(f"OSRM Routing failed: {e}")
+        
+    return None
