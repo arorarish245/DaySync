@@ -1,4 +1,5 @@
 import json
+import urllib.parse
 import google.generativeai as genai
 from tavily import TavilyClient
 from app.config import settings
@@ -47,13 +48,13 @@ def extract_data_with_ai(user_prompt: str, user_city: str) -> dict:
 
 
 def search_for_places(location: str, activity: dict) -> list:
-    """Uses Tavily to search the web for real places matching the AI's criteria."""
+    """Uses Tavily to search the web for real FAMOUS places matching the AI's criteria."""
     
     # Initialize the Tavily client
     tavily_client = TavilyClient(api_key=settings.TAVILY_API_KEY)
     
     # Construct a highly specific Google search query
-    query = f"Top rated {activity['type']} in {location} "
+    query = f"Most famous, iconic, and top-rated {activity['type']} in {location} "
     if activity.get('specific_request') and activity['specific_request'] != "unspecified":
          query += f"serving {activity['specific_request']} "
     if activity.get('vibe') and activity['vibe'] != "unspecified":
@@ -65,14 +66,14 @@ def search_for_places(location: str, activity: dict) -> list:
     response = tavily_client.search(
         query=query,
         search_depth="basic",
-        max_results=3 # We only want the top 3 options
+        max_results=4 
     )
     
     # Extract just the clean results
     return response.get("results", [])
 
 def extract_specific_places_from_search(search_results: list, activity: dict) -> list:
-    """Takes raw search results and uses Gemini to extract the actual place names."""
+    """Takes raw search results and Uses AI to extract ONLY widely recognized, famous places, with strict enterprise-level quality control."""
     
     # If the search failed, return an empty list
     if not search_results:
@@ -88,8 +89,10 @@ def extract_specific_places_from_search(search_results: list, activity: dict) ->
     
     {search_context}
     
-    Read the text above and extract the names of up to 3 SPECIFIC places (e.g., actual names of parks, cafes, restaurants). 
-    Do not return aggregator names like "Tripadvisor" or "Justdial".
+    CRITICAL INSTRUCTIONS:
+    1. Extract up to 3 SPECIFIC places (actual names of businesses).
+    2. QUALITY CONTROL: You MUST strictly extract only highly famous, and widely recognized places. Reject any obscure stalls, unknown locations, or places with few reviews.
+    3. Do not return aggregator names like "Tripadvisor" or "Justdial".
     
     Return strictly in this JSON format:
     [
@@ -120,41 +123,68 @@ def get_coordinates(place_name: str):
             return (location.latitude, location.longitude)
         return None
     except Exception as e:
-        print(f"Map error for {place_name}: {e}")
         return None
 
-def filter_by_distance(base_location: str, suggested_places: list, max_radius_km: float = 10.0) -> list:
-    """Filters out AI suggestions that are too far away."""
-    
-    # 1. Find the coordinates of the neighborhood the user asked for (e.g., "Gandhinagar, Ahmedabad")
+def filter_by_distance(base_location: str, suggested_places: list, max_radius_km: float = 15.0) -> list:
+    """Safely verifies places using an expanding geographic search to get distance in km."""
     base_coords = get_coordinates(base_location)
     
     if not base_coords:
-        print(f"Could not find base location on map: {base_location}")
-        return suggested_places # If the map fails, just return the AI's list to be safe
+        return suggested_places 
 
     valid_places = []
     
+    # Break down the location into Neighborhood, City, State
+    # e.g., ["Gandhi Nagar", "Ahmedabad", "Gujarat", "India"]
+    location_parts = [p.strip() for p in base_location.split(',')]
+    neighborhood = location_parts[0] if len(location_parts) > 0 else base_location
+    broad_city = location_parts[1] if len(location_parts) > 1 else neighborhood
+    state = location_parts[2] if len(location_parts) > 2 else broad_city
+
     for place in suggested_places:
-        # To make the map search accurate, we combine the place name with the city
-        search_query = f"{place['name']}, {base_location}"
-        place_coords = get_coordinates(search_query)
+        place_coords = None
         
-        if place_coords:
-            # Calculate the distance in kilometers
-            distance = geodesic(base_coords, place_coords).kilometers
-            print(f"Distance to {place['name']}: {distance:.2f} km")
+        # SEARCH ATTEMPT 1: Exact Neighborhood (e.g., "Manek Chowk, Gandhi Nagar")
+        place_coords = get_coordinates(f"{place['name']}, {neighborhood}")
+        
+        # SEARCH ATTEMPT 2: Broader City (e.g., "Manek Chowk, Ahmedabad")
+        if not place_coords and broad_city != neighborhood:
+            print(f"Expanding search for {place['name']} to {broad_city}...")
+            place_coords = get_coordinates(f"{place['name']}, {broad_city}")
+            time.sleep(1) # Extra sleep to avoid OpenStreetMap rate limits
             
-            # If it's within our radius, keep it!
+        # SEARCH ATTEMPT 3: Whole State (e.g., "Manek Chowk, Gujarat")
+        if not place_coords and state != broad_city:
+            print(f"Expanding search for {place['name']} to {state}...")
+            place_coords = get_coordinates(f"{place['name']}, {state}")
+            time.sleep(1)
+
+        # If we finally found the coordinates, calculate the distance!
+        if place_coords:
+            distance = geodesic(base_coords, place_coords).kilometers
+            
             if distance <= max_radius_km:
+                place["coordinates"] = {"lat": place_coords[0], "lng": place_coords[1]}
+                place["distance_from_base_km"] = round(distance, 2)
+                place["map_verified"] = True
+                
+                # Create a Google Maps route URL using exact coordinates!
+                place["google_maps_url"] = f"https://www.google.com/maps/dir/?api=1&destination={place_coords[0]},{place_coords[1]}"
+                
                 valid_places.append(place)
+                print(f"FULL VERIFIED: {place['name']} is {distance:.2f} km away.")
             else:
-                print(f"TRASHED: {place['name']} is too far ({distance:.2f} km)")
+                print(f"TRASHED (Too Far): {place['name']} is {distance:.2f} km away.")
         else:
-            # If the map can't find the specific restaurant, keep it just in case
+            print(f"WEB ONLY: Keeping {place['name']} without exact distance.")
+            place["map_verified"] = False
+            
+            # Create a Google Maps Search URL using the name of the place!
+            encoded_query = urllib.parse.quote(f"{place['name']}, {broad_city}")
+            place["google_maps_url"] = f"https://www.google.com/maps/search/?api=1&query={encoded_query}"
+            
             valid_places.append(place)
             
-        # OpenStreetMap is free, but they require us to wait 1 second between searches
         time.sleep(1) 
         
     return valid_places
